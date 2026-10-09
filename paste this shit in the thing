@@ -1,0 +1,389 @@
+cat << 'EOF' > ~/.local/bin/spotify-vis-gui
+#!/usr/bin/env python3
+import os, sys, subprocess
+
+# Single-instance toggle behavior
+my_pid = os.getpid()
+try:
+    pids = subprocess.check_output(['pgrep', '-f', 'spotify-vis-gui'], text=True).strip().split()
+    other_pids = [p for p in pids if int(p) != my_pid]
+    if other_pids:
+        for pid in other_pids:
+            subprocess.run(['kill', pid])
+        sys.exit(0)
+except subprocess.CalledProcessError:
+    pass
+
+import json, time, math, tempfile, threading, urllib.request, urllib.parse, re
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+import cairo
+
+CAVA_BARS = 36
+
+THEMES = [
+    {
+        "name": "Spotify Green",
+        "bg": Gdk.RGBA(0.05, 0.05, 0.07, 1.0),
+        "artist_color": "#1DB954",
+        "bar_top": (0.11, 0.72, 0.32, 0.9),
+        "bar_bot": (0.05, 0.25, 0.12, 0.3),
+    },
+    {
+        "name": "Cyberpunk Neon",
+        "bg": Gdk.RGBA(0.03, 0.02, 0.08, 1.0),
+        "artist_color": "#FF007F",
+        "bar_top": (1.0, 0.0, 0.5, 0.95),
+        "bar_bot": (0.0, 0.94, 1.0, 0.4),
+    },
+    {
+        "name": "Catppuccin Mocha",
+        "bg": Gdk.RGBA(0.12, 0.12, 0.18, 1.0),
+        "artist_color": "#CBA6F7",
+        "bar_top": (0.8, 0.65, 0.97, 0.9),
+        "bar_bot": (0.54, 0.71, 0.98, 0.4),
+    },
+    {
+        "name": "AMOLED Minimal",
+        "bg": Gdk.RGBA(0.0, 0.0, 0.0, 1.0),
+        "artist_color": "#FFFFFF",
+        "bar_top": (1.0, 1.0, 1.0, 0.95),
+        "bar_bot": (0.3, 0.3, 0.3, 0.2),
+    },
+    {
+        "name": "Nordic Frost",
+        "bg": Gdk.RGBA(0.18, 0.20, 0.25, 1.0),
+        "artist_color": "#88C0D0",
+        "bar_top": (0.53, 0.75, 0.82, 0.95),
+        "bar_bot": (0.51, 0.63, 0.76, 0.3),
+    }
+]
+
+class MusicVisApp(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="SpotifyVis")
+        self.set_default_size(1280, 720)
+        self.fullscreen()
+        self.connect("destroy", self.on_destroy)
+        self.connect("key-press-event", self.on_key_press)
+
+        self.theme_idx = 0
+        self.toast_timer_id = None
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        main_box.set_margin_top(30)
+        main_box.set_margin_bottom(30)
+        main_box.set_margin_start(60)
+        main_box.set_margin_end(60)
+        self.add(main_box)
+
+        # Top Bar
+        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        main_box.pack_start(top_bar, False, False, 0)
+
+        self.hint_label = Gtk.Label()
+        self.hint_label.set_markup("<span font='10' foreground='#666666'>[T] Cycle Themes | [ESC / Q] Exit</span>")
+        top_bar.pack_start(self.hint_label, False, False, 0)
+
+        self.theme_toast = Gtk.Label()
+        self.theme_toast.set_halign(Gtk.Align.END)
+        top_bar.pack_end(self.theme_toast, False, False, 0)
+
+        # Center Section: Left (Cover & Info) + Right (Synced Lyrics)
+        content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=50)
+        content_box.set_halign(Gtk.Align.CENTER)
+        content_box.set_valign(Gtk.Align.CENTER)
+        main_box.pack_start(content_box, True, True, 0)
+
+        # Left Column: Metadata & Artwork
+        left_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        left_col.set_valign(Gtk.Align.CENTER)
+        content_box.pack_start(left_col, False, False, 0)
+
+        self.cover_art = Gtk.Image()
+        self.set_default_art()
+        left_col.pack_start(self.cover_art, False, False, 0)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        left_col.pack_start(info_box, False, False, 0)
+
+        self.title_label = Gtk.Label(label="No Media Playing")
+        self.title_label.set_xalign(0)
+        self.title_label.set_markup("<span font='Bold 24' foreground='#FFFFFF'>No Media Playing</span>")
+        info_box.pack_start(self.title_label, False, False, 0)
+
+        self.artist_label = Gtk.Label()
+        self.artist_label.set_xalign(0)
+        info_box.pack_start(self.artist_label, False, False, 0)
+
+        progress_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        info_box.pack_start(progress_box, False, False, 5)
+
+        self.time_pos_label = Gtk.Label(label="0:00")
+        self.time_pos_label.set_markup("<span font='11' foreground='#888888'>0:00</span>")
+        progress_box.pack_start(self.time_pos_label, False, False, 0)
+
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_bar.set_size_request(260, 6)
+        progress_box.pack_start(self.progress_bar, True, True, 0)
+
+        self.time_len_label = Gtk.Label(label="0:00")
+        self.time_len_label.set_markup("<span font='11' foreground='#888888'>0:00</span>")
+        progress_box.pack_start(self.time_len_label, False, False, 0)
+
+        # Right Column: Synced Lyrics Container
+        self.lyrics_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.lyrics_box.set_valign(Gtk.Align.CENTER)
+        self.lyrics_box.set_size_request(500, 320)
+        content_box.pack_start(self.lyrics_box, False, False, 0)
+
+        self.lyric_labels = []
+        for _ in range(5):
+            lbl = Gtk.Label()
+            lbl.set_xalign(0)
+            lbl.set_line_wrap(True)
+            self.lyrics_box.pack_start(lbl, False, False, 0)
+            self.lyric_labels.append(lbl)
+
+        # Canvas Spectrum Visualizer
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_size_request(-1, 140)
+        self.drawing_area.connect("draw", self.on_draw)
+        main_box.pack_end(self.drawing_area, False, False, 0)
+
+        # State Variables
+        self.bars = [0] * CAVA_BARS
+        self.last_art_url = ""
+        self.current_title = ""
+        self.current_artist = ""
+        self.current_track_key = ""
+        self.parsed_lyrics = []
+        self.lyrics_loading = False
+
+        self.apply_theme(show_toast=False)
+        self.start_cava()
+        GLib.timeout_add(100, self.update_metadata)
+
+    def apply_theme(self, show_toast=True):
+        theme = THEMES[self.theme_idx]
+        self.override_background_color(Gtk.StateFlags.NORMAL, theme["bg"])
+        self.artist_label.set_markup(f"<span font='16' foreground='{theme['artist_color']}'>{GLib.markup_escape_text(self.current_artist or 'Waiting for audio...')}</span>")
+
+        if show_toast:
+            self.theme_toast.set_markup(f"<span font='Bold 11' foreground='{theme['artist_color']}'>Theme: {theme['name']}</span>")
+            if self.toast_timer_id:
+                GLib.source_remove(self.toast_timer_id)
+            self.toast_timer_id = GLib.timeout_add(1800, self.clear_toast)
+
+        self.render_lyrics(getattr(self, 'current_pos', 0))
+        self.drawing_area.queue_draw()
+
+    def clear_toast(self):
+        self.theme_toast.set_markup("")
+        self.toast_timer_id = None
+        return False
+
+    def set_default_art(self):
+        pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, 260, 260)
+        pixbuf.fill(0x181818FF)
+        self.cover_art.set_from_pixbuf(pixbuf)
+
+    def fetch_lyrics(self, title, artist):
+        self.lyrics_loading = True
+        try:
+            params = urllib.parse.urlencode({'track_name': title, 'artist_name': artist})
+            url = f"https://lrclib.net/api/get?{params}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'SpotifyVisApp/1.0'})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode())
+                lrc_text = data.get('syncedLyrics') or ""
+                self.parsed_lyrics = self.parse_lrc(lrc_text)
+        except Exception:
+            self.parsed_lyrics = []
+        finally:
+            self.lyrics_loading = False
+            GLib.idle_add(lambda: self.render_lyrics(getattr(self, 'current_pos', 0)))
+
+    def parse_lrc(self, lrc_text):
+        if not lrc_text:
+            return []
+        lines = []
+        pattern = re.compile(r'\[(\d+):(\d+(?:\.\d+)?)\](.*)')
+        for line in lrc_text.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                m = int(match.group(1))
+                s = float(match.group(2))
+                txt = match.group(3).strip()
+                if txt:
+                    lines.append((m * 60 + s, txt))
+        return lines
+
+    def render_lyrics(self, current_pos):
+        theme = THEMES[self.theme_idx]
+        color = theme['artist_color']
+
+        if self.lyrics_loading:
+            self.lyric_labels[2].set_markup("<span font='16' foreground='#888888'>Searching for synced lyrics...</span>")
+            for i in [0, 1, 3, 4]:
+                self.lyric_labels[i].set_markup("")
+            return
+
+        if not self.parsed_lyrics:
+            self.lyric_labels[2].set_markup("<span font='16' foreground='#555555'>No synced lyrics available</span>")
+            for i in [0, 1, 3, 4]:
+                self.lyric_labels[i].set_markup("")
+            return
+
+        active_idx = 0
+        for i, (t, txt) in enumerate(self.parsed_lyrics):
+            if current_pos >= t:
+                active_idx = i
+            else:
+                break
+
+        window_range = range(active_idx - 2, active_idx + 3)
+        for idx_slot, l_idx in enumerate(window_range):
+            if 0 <= l_idx < len(self.parsed_lyrics):
+                txt = GLib.markup_escape_text(self.parsed_lyrics[l_idx][1])
+                if l_idx == active_idx:
+                    self.lyric_labels[idx_slot].set_markup(f"<span font='Bold 20' foreground='{color}'>{txt}</span>")
+                else:
+                    self.lyric_labels[idx_slot].set_markup(f"<span font='15' foreground='#555555'>{txt}</span>")
+            else:
+                self.lyric_labels[idx_slot].set_markup("")
+
+    def update_metadata(self):
+        try:
+            cmd = ['playerctl', 'metadata', '--format',
+                   '{"title": "{{title}}", "artist": "{{artist}}", "artUrl": "{{mpris:artUrl}}", "position": "{{position}}", "length": "{{mpris:length}}"}']
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                self.current_title = data.get("title", "Unknown Title") or "Unknown Title"
+                self.current_artist = data.get("artist", "Unknown Artist") or "Unknown Artist"
+                art_url = data.get("artUrl", "")
+                pos = float(data.get("position", 0) or 0) / 1000000.0
+                length = float(data.get("length", 0) or 0) / 1000000.0
+                self.current_pos = pos
+
+                track_key = f"{self.current_title} - {self.current_artist}"
+                if track_key != self.current_track_key and self.current_title != "Unknown Title":
+                    self.current_track_key = track_key
+                    threading.Thread(target=self.fetch_lyrics, args=(self.current_title, self.current_artist), daemon=True).start()
+
+                theme = THEMES[self.theme_idx]
+                self.title_label.set_markup(f"<span font='Bold 24' foreground='#FFFFFF'>{GLib.markup_escape_text(self.current_title)}</span>")
+                self.artist_label.set_markup(f"<span font='16' foreground='{theme['artist_color']}'>{GLib.markup_escape_text(self.current_artist)}</span>")
+
+                if length > 0:
+                    fraction = min(1.0, max(0.0, pos / length))
+                    self.progress_bar.set_fraction(fraction)
+                    self.time_pos_label.set_markup(f"<span font='11' foreground='#BBBBBB'>{int(pos//60)}:{int(pos%60):02d}</span>")
+                    self.time_len_label.set_markup(f"<span font='11' foreground='#BBBBBB'>{int(length//60)}:{int(length%60):02d}</span>")
+
+                self.render_lyrics(pos)
+
+                if art_url != self.last_art_url:
+                    self.last_art_url = art_url
+                    self.load_art(art_url)
+        except Exception:
+            pass
+        return True
+
+    def load_art(self, url):
+        if not url:
+            self.set_default_art()
+            return
+        try:
+            local_path = url.replace("file://", "") if url.startswith("file://") else None
+            if not local_path and url.startswith("http"):
+                tmp = tempfile.NamedTemporaryFile(delete=False)
+                urllib.request.urlretrieve(url, tmp.name)
+                local_path = tmp.name
+
+            if local_path and os.path.exists(local_path):
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(local_path, 260, 260, True)
+                self.cover_art.set_from_pixbuf(pixbuf)
+        except Exception:
+            self.set_default_art()
+
+    def start_cava(self):
+        cava_cfg = f"""
+[general]
+bars = {CAVA_BARS}
+framerate = 60
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 100
+"""
+        cfg_file = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        cfg_file.write(cava_cfg)
+        cfg_file.close()
+
+        def read_cava():
+            proc = subprocess.Popen(['cava', '-p', cfg_file.name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            while proc.poll() is None:
+                line = proc.stdout.readline()
+                if line:
+                    parts = line.strip().split(';')
+                    val = []
+                    for p in parts:
+                        if p.isdigit():
+                            val.append(int(p) / 100.0)
+                    if len(val) >= CAVA_BARS:
+                        self.bars = val[:CAVA_BARS]
+                        GLib.idle_add(self.drawing_area.queue_draw)
+
+        threading.Thread(target=read_cava, daemon=True).start()
+
+    def on_draw(self, widget, cr):
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+
+        theme = THEMES[self.theme_idx]
+        top_r, top_g, top_b, top_a = theme["bar_top"]
+        bot_r, bot_g, bot_b, bot_a = theme["bar_bot"]
+
+        num_bars = len(self.bars)
+        spacing = 6
+        bar_width = (width - (num_bars * spacing)) / num_bars
+
+        for i, val in enumerate(self.bars):
+            x = i * (bar_width + spacing)
+            bar_height = max(4, val * height)
+            y = height - bar_height
+
+            pat = cairo.LinearGradient(x, y, x, height)
+            pat.add_color_stop_rgba(0, top_r, top_g, top_b, top_a)
+            pat.add_color_stop_rgba(1, bot_r, bot_g, bot_b, bot_a)
+            cr.set_source(pat)
+
+            radius = min(4, bar_width / 2)
+            cr.new_sub_path()
+            cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+            cr.arc(x + bar_width - radius, y + radius, radius, 3 * math.pi / 2, 2 * math.pi)
+            cr.line_to(x + bar_width, height)
+            cr.line_to(x, height)
+            cr.close_path()
+            cr.fill()
+
+    def on_key_press(self, widget, event):
+        if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_q):
+            self.close()
+        elif event.keyval in (Gdk.KEY_t, Gdk.KEY_T):
+            self.theme_idx = (self.theme_idx + 1) % len(THEMES)
+            self.apply_theme(show_toast=True)
+
+    def on_destroy(self, widget):
+        Gtk.main_quit()
+
+if __name__ == "__main__":
+    app = MusicVisApp()
+    app.show_all()
+    Gtk.main()
+EOF
+chmod +x ~/.local/bin/spotify-vis-gui
